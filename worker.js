@@ -8,20 +8,14 @@
 
 const NVIDIA_API_URL = "https://integrate.api.nvidia.com/v1/chat/completions";
 const NVIDIA_MODELS_URL = "https://integrate.api.nvidia.com/v1/models";
-const DEFAULT_MODEL = "openai/gpt-oss-20b";
+const DEFAULT_MODEL = "mistralai/mistral-small-4-119b-2603";
 const MAX_CONTEXT = 40;
-
-// ─────────────────────────────────────────────
-// KV helpers
-// ─────────────────────────────────────────────
 
 async function kvGet(env, key) {
   try {
     const val = await env.KV.get(key);
     return val ? JSON.parse(val) : null;
-  } catch {
-    return null;
-  }
+  } catch { return null; }
 }
 
 async function kvSet(env, key, value, ttl = null) {
@@ -29,13 +23,7 @@ async function kvSet(env, key, value, ttl = null) {
   await env.KV.put(key, JSON.stringify(value), opts);
 }
 
-async function kvDel(env, key) {
-  await env.KV.delete(key);
-}
-
-// ─────────────────────────────────────────────
-// History
-// ─────────────────────────────────────────────
+async function kvDel(env, key) { await env.KV.delete(key); }
 
 async function getHistory(env, chatId) {
   const data = await kvGet(env, `history:${chatId}`);
@@ -49,13 +37,7 @@ async function saveMsg(env, chatId, role, content) {
   await kvSet(env, `history:${chatId}`, history);
 }
 
-async function resetHistory(env, chatId) {
-  await kvDel(env, `history:${chatId}`);
-}
-
-// ─────────────────────────────────────────────
-// Model per chat
-// ─────────────────────────────────────────────
+async function resetHistory(env, chatId) { await kvDel(env, `history:${chatId}`); }
 
 async function getModel(env, chatId) {
   return (await kvGet(env, `model:${chatId}`)) || DEFAULT_MODEL;
@@ -65,32 +47,18 @@ async function saveModel(env, chatId, model) {
   await kvSet(env, `model:${chatId}`, model);
 }
 
-// ─────────────────────────────────────────────
-// Access control
-// ─────────────────────────────────────────────
-
-function isOwner(env, userId) {
-  return String(userId) === String(env.OWNER_ID);
-}
+function isOwner(env, userId) { return String(userId) === String(env.OWNER_ID); }
 
 async function isApproved(env, userId) {
   if (isOwner(env, userId)) return true;
   return (await kvGet(env, `approved:${userId}`)) === true;
 }
 
-async function approveUser(env, userId) {
-  await kvSet(env, `approved:${userId}`, true);
-}
-
-async function unapproveUser(env, userId) {
-  await kvDel(env, `approved:${userId}`);
-}
+async function approveUser(env, userId) { await kvSet(env, `approved:${userId}`, true); }
+async function unapproveUser(env, userId) { await kvDel(env, `approved:${userId}`); }
 
 // ─────────────────────────────────────────────
-// Auto model params
-// 1. Fetch max_context_length from NVIDIA /v1/models/{model} (cached 24h in KV)
-// 2. Detect thinking model by name prefix
-// 3. Set temperature/top_p accordingly
+// Model configs
 // ─────────────────────────────────────────────
 
 const THINKING_PREFIXES = [
@@ -100,16 +68,23 @@ const THINKING_PREFIXES = [
   "nvidia/llama-3.1-nemotron-ultra",
 ];
 
+const REASONING_MODELS = [
+  "mistralai/mistral-small-4-119b-2603",
+];
+
 function isThinkingModel(model) {
   const m = model.toLowerCase();
   return THINKING_PREFIXES.some((p) => m.startsWith(p));
+}
+
+function isReasoningModel(model) {
+  return REASONING_MODELS.includes(model.toLowerCase());
 }
 
 async function fetchModelMaxTokens(env, model) {
   const cacheKey = `modelinfo:${model}`;
   const cached = await kvGet(env, cacheKey);
   if (cached !== null) return cached;
-
   try {
     const resp = await fetch(`${NVIDIA_MODELS_URL}/${encodeURIComponent(model)}`, {
       headers: { Authorization: `Bearer ${env.NVIDIA_API_KEY}` },
@@ -123,25 +98,25 @@ async function fetchModelMaxTokens(env, model) {
         return maxOut;
       }
     }
-  } catch {
-    // ignore, return null
-  }
+  } catch {}
   return null;
 }
 
 async function getModelParams(env, model) {
   const thinking = isThinkingModel(model);
+  const reasoning = isReasoningModel(model);
   const fetched = await fetchModelMaxTokens(env, model);
   const maxTokens = fetched || (thinking ? 16384 : 4096);
 
   const params = {
     max_tokens: maxTokens,
-    temperature: thinking ? 1.0 : 0.7,
-    top_p: thinking ? 1.0 : 0.9,
+    temperature: thinking ? 1.0 : 0.10,
+    top_p: 1.0,
     stream: false,
   };
 
   if (thinking) params.chat_template_kwargs = { thinking: true };
+  if (reasoning) params.reasoning_effort = "high";
 
   return params;
 }
@@ -150,9 +125,7 @@ async function getModelParams(env, model) {
 // NVIDIA API call
 // ─────────────────────────────────────────────
 
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
-}
+function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
 async function callNvidiaAPI(env, messages, model) {
   const retryWaits = [3000, 6000, 12000, 20000];
@@ -278,7 +251,6 @@ async function sendMessage(env, chatId, text, replyTo = null) {
     disable_web_page_preview: true,
   };
   if (replyTo) body.reply_to_message_id = replyTo;
-
   const result = await tgCall(env, "sendMessage", body);
   if (!result.ok) {
     const fallback = { chat_id: chatId, text: text.slice(0, 4096), disable_web_page_preview: true };
@@ -321,7 +293,6 @@ async function handleStart(env, update) {
   const { id: userId } = update.message.from;
   const chatId = update.message.chat.id;
   const msgId = update.message.message_id;
-
   if (!(await isApproved(env, userId))) {
     await sendMessage(env, chatId, `Access denied.\nYour ID: <code>${userId}</code>\nAsk owner to approve.`, msgId);
     return;
@@ -333,7 +304,6 @@ async function handleReset(env, update) {
   const { id: userId } = update.message.from;
   const chatId = update.message.chat.id;
   const msgId = update.message.message_id;
-
   if (!(await isApproved(env, userId))) { await sendMessage(env, chatId, "Access denied.", msgId); return; }
   await resetHistory(env, chatId);
   await sendMessage(env, chatId, "Memory cleared.", msgId);
@@ -344,7 +314,6 @@ async function handleSetModel(env, update) {
   const chatId = update.message.chat.id;
   const msgId = update.message.message_id;
   const args = (update.message.text || "").trim().split(/\s+/).slice(1);
-
   if (!(await isApproved(env, userId))) { await sendMessage(env, chatId, "Access denied.", msgId); return; }
 
   if (!args.length) {
@@ -360,6 +329,7 @@ async function handleSetModel(env, update) {
   await saveModel(env, chatId, model);
   const params = await getModelParams(env, model);
   const thinking = isThinkingModel(model);
+  const reasoning = isReasoningModel(model);
 
   const lines = [
     `Model: <code>${model}</code>`,
@@ -367,13 +337,11 @@ async function handleSetModel(env, update) {
     `temperature: ${params.temperature}`,
     `top_p: ${params.top_p}`,
     thinking ? `thinking: true` : null,
+    reasoning ? `reasoning_effort: high` : null,
   ].filter(Boolean).join("\n");
 
-  if (loadMsgId) {
-    await editMessage(env, chatId, loadMsgId, lines);
-  } else {
-    await sendMessage(env, chatId, lines, msgId);
-  }
+  if (loadMsgId) await editMessage(env, chatId, loadMsgId, lines);
+  else await sendMessage(env, chatId, lines, msgId);
 }
 
 async function handleApprove(env, update) {
@@ -381,7 +349,6 @@ async function handleApprove(env, update) {
   const chatId = update.message.chat.id;
   const msgId = update.message.message_id;
   const args = (update.message.text || "").trim().split(/\s+/).slice(1);
-
   if (!isOwner(env, userId)) { await sendMessage(env, chatId, "Owner only.", msgId); return; }
   if (!args[0] || !/^\d+$/.test(args[0])) { await sendMessage(env, chatId, "Usage: /approve user_id", msgId); return; }
   await approveUser(env, args[0]);
@@ -393,7 +360,6 @@ async function handleUnapprove(env, update) {
   const chatId = update.message.chat.id;
   const msgId = update.message.message_id;
   const args = (update.message.text || "").trim().split(/\s+/).slice(1);
-
   if (!isOwner(env, userId)) { await sendMessage(env, chatId, "Owner only.", msgId); return; }
   if (!args[0] || !/^\d+$/.test(args[0])) { await sendMessage(env, chatId, "Usage: /unapprove user_id", msgId); return; }
   if (args[0] === String(env.OWNER_ID)) { await sendMessage(env, chatId, "Owner ko unapprove nahi kar sakte.", msgId); return; }
@@ -410,7 +376,6 @@ async function handleMessage(env, update) {
   const chatId = update.message.chat.id;
   const msgId = update.message.message_id;
   const text = (update.message.text || "").trim();
-
   if (!text) return;
 
   if (!(await isApproved(env, userId))) {
@@ -426,7 +391,6 @@ async function handleMessage(env, update) {
 
   const model = await getModel(env, chatId);
   const history = await getHistory(env, chatId);
-
   const messages = [
     ...history.map(({ role, content }) => ({ role, content })),
     { role: "user", content: text },
@@ -435,11 +399,8 @@ async function handleMessage(env, update) {
   const response = await callNvidiaAPI(env, messages, model);
   const chunks = splitText(response, 3900);
 
-  if (sentMsgId) {
-    await editMessage(env, chatId, sentMsgId, chunks[0]);
-  } else {
-    await sendMessage(env, chatId, chunks[0]);
-  }
+  if (sentMsgId) await editMessage(env, chatId, sentMsgId, chunks[0]);
+  else await sendMessage(env, chatId, chunks[0]);
 
   for (let i = 1; i < chunks.length; i++) {
     await sendMessage(env, chatId, chunks[i]);
@@ -455,7 +416,6 @@ async function handleMessage(env, update) {
 
 async function handleUpdate(env, update) {
   if (!update.message?.text) return;
-
   const text = (update.message.text || "").trim();
   const cmd = text.split(/\s+/)[0].toLowerCase().replace(/@.*$/, "");
 
